@@ -5,12 +5,16 @@
 class CyberAudioEngine {
     constructor() {
         this.audio = new Audio();
-        this.audio.crossOrigin = "anonymous";
+        // Do not set crossOrigin = "anonymous" unconditionally.
+        // On Android WebView and Linux WebKitGTK, setting crossOrigin on local custom schemes
+        // (like asset:// or https://asset.localhost/) causes CORS rejection, playback errors,
+        // and audio stuttering. Only remote external HTTP streams require crossOrigin.
         this.currentObjectUrl = null;
         this.ctx = null;
         this.source = null;
         this.analyser = null;
         this.masterGain = null;
+        this.limiter = null;
         this.eqNodes = [];
         this.sandevistanFilter = null;
         this.isSandevistanActive = false;
@@ -29,6 +33,8 @@ class CyberAudioEngine {
         this.onTrackEnd = null;
         this.onLoadedMetadata = null;
         this.onPlayStateChange = null;
+        this.onAudioError = null;
+        this.onPlayBlocked = null;
 
         this.setupAudioEvents();
     }
@@ -37,7 +43,12 @@ class CyberAudioEngine {
         if (this.initialized) return;
 
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        this.ctx = new AudioCtx();
+        // Use playback latency hint to prevent buffer underruns, glitches, and crackles on Android
+        try {
+            this.ctx = new AudioCtx({ latencyHint: 'playback' });
+        } catch (_) {
+            this.ctx = new AudioCtx();
+        }
 
         this.source = this.ctx.createMediaElementSource(this.audio);
         this.analyser = this.ctx.createAnalyser();
@@ -70,7 +81,18 @@ class CyberAudioEngine {
         prevNode.connect(this.sandevistanFilter);
         this.sandevistanFilter.connect(this.analyser);
         this.analyser.connect(this.masterGain);
-        this.masterGain.connect(this.ctx.destination);
+
+        // Brickwall limiter/compressor to eliminate digital clipping, harsh distortion,
+        // and noise ("szumy") from aggressive EQ boosts on mobile speakers/DACs
+        this.limiter = this.ctx.createDynamicsCompressor();
+        this.limiter.threshold.setValueAtTime(-0.8, this.ctx.currentTime);
+        this.limiter.knee.setValueAtTime(0.0, this.ctx.currentTime);
+        this.limiter.ratio.setValueAtTime(20.0, this.ctx.currentTime);
+        this.limiter.attack.setValueAtTime(0.002, this.ctx.currentTime);
+        this.limiter.release.setValueAtTime(0.05, this.ctx.currentTime);
+
+        this.masterGain.connect(this.limiter);
+        this.limiter.connect(this.ctx.destination);
 
         this.initialized = true;
     }
@@ -93,11 +115,25 @@ class CyberAudioEngine {
         });
 
         this.audio.addEventListener('play', () => {
+            if ('mediaSession' in navigator) {
+                try { navigator.mediaSession.playbackState = 'playing'; } catch (_) {}
+            }
             if (this.onPlayStateChange) this.onPlayStateChange(true);
         });
 
         this.audio.addEventListener('pause', () => {
+            if ('mediaSession' in navigator) {
+                try { navigator.mediaSession.playbackState = 'paused'; } catch (_) {}
+            }
             if (this.onPlayStateChange) this.onPlayStateChange(false);
+        });
+
+        this.audio.addEventListener('error', (e) => {
+            const err = this.audio.error;
+            console.error('Audio element playback error:', err ? `code=${err.code}, message=${err.message}` : e);
+            if (this.onAudioError) {
+                this.onAudioError(err);
+            }
         });
     }
 
@@ -105,6 +141,18 @@ class CyberAudioEngine {
         this.initContext();
         if (this.ctx && this.ctx.state === 'suspended') {
             await this.ctx.resume();
+        }
+
+        // Only set crossOrigin for remote HTTP/HTTPS streaming URLs.
+        // For local asset URLs (asset.localhost, asset://, blob:, file:),
+        // setting crossOrigin breaks Android WebView and Linux WebKitGTK.
+        if (url && (url.startsWith('http:') || url.startsWith('https:'))
+            && !url.includes('asset.localhost')
+            && !url.includes('tauri.localhost')
+            && !url.includes('127.0.0.1')) {
+            this.audio.crossOrigin = 'anonymous';
+        } else {
+            this.audio.removeAttribute('crossorigin');
         }
 
         let playbackUrl = url;
@@ -117,7 +165,11 @@ class CyberAudioEngine {
         // WebKitGTK cannot reliably use Tauri's asset protocol as a media
         // source. A loopback HTTP URL supports streaming and byte-range seeks.
         if (isLinuxTauri && isTauriAssetUrl && filePath) {
-            playbackUrl = await window.__TAURI__.core.invoke('local_audio_url', { filePath });
+            try {
+                playbackUrl = await window.__TAURI__.core.invoke('local_audio_url', { filePath });
+            } catch (err) {
+                console.warn('Could not acquire local audio loopback URL:', err);
+            }
         }
 
         if (this.currentObjectUrl) {
@@ -140,6 +192,9 @@ class CyberAudioEngine {
             await this.audio.play();
         } catch (err) {
             console.warn("Autoplay / Play blocked:", err);
+            if (this.onPlayBlocked) {
+                this.onPlayBlocked(err);
+            }
         }
     }
 

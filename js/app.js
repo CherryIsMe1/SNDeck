@@ -8,6 +8,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const visualizer = new window.CyberVisualizer(canvas);
     visualizer.start();
 
+    // Pause heavy visualizer canvas rendering when screen is locked or app is in background.
+    // This saves CPU and prevents audio buffer underruns, interruptions, and dropouts on mobile.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            visualizer.stop();
+        } else if (window.AudioEngine && !window.AudioEngine.audio.paused) {
+            visualizer.start();
+        }
+    });
+
     // 2. DOM Elements
     const elements = {
         // Files
@@ -429,7 +439,20 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.AudioEngine.onTrackEnd = () => {
-        playNextTrack();
+        playNextTrack(false);
+    };
+
+    window.AudioEngine.onAudioError = (err) => {
+        console.warn('Audio error on current track, auto-advancing:', err);
+        // Advance to next track after brief pause to avoid tight error loops
+        setTimeout(() => {
+            playNextTrack(false);
+        }, 750);
+    };
+
+    window.AudioEngine.onPlayBlocked = (err) => {
+        console.warn('Audio playback was blocked by browser policy:', err);
+        updatePlayButtonState(false);
     };
 
     window.AudioEngine.onPlayStateChange = (isPlaying) => {
@@ -450,15 +473,17 @@ document.addEventListener('DOMContentLoaded', () => {
         elements.holoTurntable.classList.toggle('spinning', isPlaying || spinBoostSources.size > 0);
     }
 
-    async function playTrack(track) {
+    async function playTrack(track, isUserAction = false) {
         if (!track) return;
-        window.CyberSound.playClick();
+        if (isUserAction) {
+            window.CyberSound.playClick();
+        }
         window.PlaylistManager.setCurrentTrack(track.id);
 
         // Update Now Playing UI
         elements.trackLiveTitle.textContent = track.title || 'Unknown Track';
         elements.trackLiveArtist.textContent = track.artist || 'Unknown Artist';
-        elements.trackLiveAlbum.textContent = `${track.album || 'SNDeck'} • ${track.year || new Date().getFullYear()}`;
+        elements.trackLiveAlbum.textContent = `${track.album || 'SNDeck'} \u2022 ${track.year || new Date().getFullYear()}`;
 
         updateCoverArtDisplay();
         if (track && !track.coverArt && track.filePath && window.PlaylistManager.restoreTrackCover) {
@@ -467,14 +492,17 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
 
-        // Set system MediaSession
+        // Set system MediaSession with explicit playbackState for Android background playback
         if ('mediaSession' in navigator) {
-            navigator.mediaSession.metadata = new MediaMetadata({
-                title: track.title,
-                artist: track.artist,
-                album: track.album,
-                artwork: track.coverArt ? [{ src: track.coverArt, sizes: '512x512', type: 'image/jpeg' }] : [{ src: defaultPortrait, sizes: '512x512', type: 'image/svg+xml' }]
-            });
+            try {
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: track.title,
+                    artist: track.artist,
+                    album: track.album,
+                    artwork: track.coverArt ? [{ src: track.coverArt, sizes: '512x512', type: 'image/jpeg' }] : [{ src: defaultPortrait, sizes: '512x512', type: 'image/svg+xml' }]
+                });
+                navigator.mediaSession.playbackState = 'playing';
+            } catch (_) {}
         }
 
         await window.AudioEngine.loadTrack(track.url, track.filePath || null);
@@ -482,19 +510,19 @@ document.addEventListener('DOMContentLoaded', () => {
         renderTracks();
     }
 
-    function playNextTrack() {
+    function playNextTrack(isUserAction = false) {
         const next = window.PlaylistManager.getNextTrack();
         if (next) {
-            playTrack(next);
+            playTrack(next, isUserAction);
         } else {
             window.AudioEngine.pause();
         }
     }
 
-    function playPrevTrack() {
+    function playPrevTrack(isUserAction = false) {
         const prev = window.PlaylistManager.getPreviousTrack();
         if (prev) {
-            playTrack(prev);
+            playTrack(prev, isUserAction);
         }
     }
 
@@ -1671,7 +1699,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (removesCurrentTrack) {
             elements.trackLiveTitle.textContent = 'SNDECK // READY TO PLAY';
             elements.trackLiveArtist.textContent = '';
-            elements.trackLiveAlbum.textContent = '';
+        elements.trackLiveAlbum.textContent = `${track.album || 'SNDeck'} \u2022 ${track.year || new Date().getFullYear()}`;
             elements.currentTimeDisplay.textContent = '0:00';
             elements.durationDisplay.textContent = '0:00';
             elements.seekBarProgress.style.width = '0%';

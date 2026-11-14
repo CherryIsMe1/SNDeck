@@ -97,8 +97,11 @@ class CyberPlaylistManager {
                         t.url = window.__TAURI__.core.convertFileSrc(t.filePath);
                         this.tracks.set(t.id, t);
                         validIds.add(t.id);
-                        // Always restore cover art from actual file
-                        this.restoreTrackCover(t);
+                        // Lazily restore cover art: only first 2 tracks on startup
+                        // to avoid mobile I/O floods; others restore on-demand in playTrack()
+                        if (!t.coverArt && validIds.size <= 2) {
+                            this.restoreTrackCover(t);
+                        }
                     } else if (!t.filePath) {
                         // Non-Tauri blob: URLs cannot be restored
                     }
@@ -128,7 +131,7 @@ class CyberPlaylistManager {
             const trackData = [];
             this.tracks.forEach(track => {
                 const { file, coverArt, ...rest } = track; // eslint-disable-line no-unused-vars
-                if (track.isRipped && typeof coverArt === 'string' && /^https?:\/\//i.test(coverArt)) {
+                if (typeof coverArt === 'string' && (/^https?:\/\//i.test(coverArt) || coverArt.length < 65536)) {
                     rest.coverArt = coverArt;
                 }
                 trackData.push(rest);
